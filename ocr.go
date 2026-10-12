@@ -43,7 +43,7 @@ type ProcessedDocument struct {
 	HOCR             string
 	PDFData          []byte
 	ReplacedOriginal bool   // true when the original document was successfully deleted and replaced
-	PDFAction        string // "none", "attached", "replaced", "skipped", "failed" — what happened to the searchable PDF
+	PDFAction        string // "none", "attached", "replaced", "skipped", "failed", "local" — searchable PDF outcome
 	PDFDetail        string // human-readable reason for "skipped"/"failed"
 }
 
@@ -130,8 +130,9 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 				if tag == app.pdfOCRCompleteTag {
 					docLogger.Infof("Document already has OCR complete tag '%s', skipping OCR processing", app.pdfOCRCompleteTag)
 					return &ProcessedDocument{
-						ID:   documentID,
-						Text: document.Content,
+						ID:        documentID,
+						Text:      document.Content,
+						PDFAction: "none",
 					}, nil
 				}
 			}
@@ -157,8 +158,9 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 				} else if ocrResult.HasOCR || ocrResult.HasLayerOCR {
 					docLogger.Infof("⚠️ Skipping OCR processing - detected existing OCR layers in PDF")
 					return &ProcessedDocument{
-						ID:   documentID,
-						Text: document.Content,
+						ID:        documentID,
+						Text:      document.Content,
+						PDFAction: "none",
 					}, nil
 				}
 			}
@@ -532,17 +534,18 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 							processedDoc.PDFData = pdfData
 
 							// Save the PDF to a file when a local copy is configured
+							localSaved := false
 							if wantLocalPDF {
 								if err := app.savePDFToFile(ctx, documentID, pdfData); err != nil {
 									docLogger.WithError(err).Error("Failed to save PDF file")
 								} else {
 									docLogger.Info("Successfully generated and saved PDF")
-									observePDFOutcome(pdfActionLocal)
-									observePDFCreated(pdfActionLocal, pdfCreateStart)
+									localSaved = true
 								}
 							}
 
-							// Upload PDF to paperless-ngx if requested
+							// Upload PDF to paperless-ngx if requested. Upload action is
+							// primary when both local save and upload succeed.
 							if options.UploadPDF && pdfData != nil {
 								err := app.uploadProcessedPDF(ctx, documentID, pdfData, options, docLogger)
 								var replaceErr *replaceAfterUploadError
@@ -550,10 +553,10 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 								case err == nil && options.ReplaceOriginal:
 									processedDoc.ReplacedOriginal = true
 									processedDoc.PDFAction = "replaced"
-									observePDFCreated(pdfActionReplaced, pdfCreateStart)
+									recordPDFResult(pdfActionReplaced, pdfCreateStart)
 								case err == nil:
 									processedDoc.PDFAction = "attached"
-									observePDFCreated(pdfActionAttached, pdfCreateStart)
+									recordPDFResult(pdfActionAttached, pdfCreateStart)
 								case errors.As(err, &replaceErr):
 									// The searchable PDF was uploaded; only deleting the
 									// original failed. Report it as attached-with-warning
@@ -562,12 +565,15 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 									docLogger.WithError(err).Error("PDF uploaded but original could not be replaced")
 									processedDoc.PDFAction = "attached"
 									processedDoc.PDFDetail = fmt.Sprintf("Searchable PDF was uploaded, but the original could not be deleted: %v", replaceErr.cause)
-									observePDFCreated(pdfActionAttached, pdfCreateStart)
+									recordPDFResult(pdfActionAttached, pdfCreateStart)
 								default:
 									docLogger.WithError(err).Error("Failed to upload processed PDF")
 									processedDoc.PDFAction = "failed"
 									processedDoc.PDFDetail = fmt.Sprintf("PDF upload failed: %v", err)
 								}
+							} else if localSaved {
+								processedDoc.PDFAction = "local"
+								recordPDFResult(pdfActionLocal, pdfCreateStart)
 							}
 						}
 					}
