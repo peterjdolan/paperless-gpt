@@ -113,7 +113,7 @@ func (app *App) getAllTagsHandler(c *gin.Context) {
 // getSettingsHandler handles the GET /api/settings endpoint
 func (app *App) getSettingsHandler(c *gin.Context) {
 	// Refresh the cache when settings are requested
-	go refreshCustomFieldsCache(app.Client)
+	go refreshCustomFieldsCache(context.Background(), app.Client)
 
 	settingsMutex.RLock()
 	defer settingsMutex.RUnlock()
@@ -157,7 +157,7 @@ func (app *App) getCustomFieldsHandler(c *gin.Context) {
 	// Check for "force_pull" query parameter
 	if forcePull := c.Query("force_pull"); forcePull == "true" {
 		// Force a refresh of the custom fields cache
-		go refreshCustomFieldsCache(app.Client)
+		go refreshCustomFieldsCache(context.Background(), app.Client)
 	}
 
 	customFieldsCacheMu.RLock()
@@ -309,6 +309,23 @@ func (app *App) updateDocumentsHandler(c *gin.Context) {
 	}
 
 	err := app.Client.UpdateDocuments(ctx, documents, app.Database, false)
+	if err == nil || errors.As(err, new(*PartialUpdateError)) {
+		clearPendingReviews(app.Database, documents)
+	}
+	var partial *PartialUpdateError
+	if errors.As(err, &partial) {
+		// The update went through without some fields. Reporting it as a
+		// failure would tell the user nothing was applied; flag the document
+		// for review like the background processor does, and say what was
+		// left out.
+		applyFailTagAfterPartialSuccess(ctx, app.Client, app.Database, partial.DocumentID, partial.DroppedFields)
+		c.JSON(http.StatusOK, gin.H{"partial": gin.H{
+			"document_id":    partial.DocumentID,
+			"dropped_fields": partial.DroppedFields,
+			"fail_tag":       failTag,
+		}})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Error updating documents: %v", err)})
 		log.Errorf("Error updating documents: %v", err)
@@ -384,6 +401,10 @@ func (app *App) submitOCRJobHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "replace_original requires upload_pdf"})
 		return
 	}
+	if options.ReplaceOriginal && options.UploadMode == PDFUploadModeVersion {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "replace_original is not available when PDF_UPLOAD_MODE=version: the PDF is added as a new version and nothing is deleted"})
+		return
+	}
 	if options.UploadPDF && !app.ocrSupportsHOCR() {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Searchable PDFs need an hOCR-capable OCR provider (enable hOCR for the LLM provider)"})
 		return
@@ -429,6 +450,7 @@ func (app *App) submitOCRJobHandler(c *gin.Context) {
 		LimitPages:       options.LimitPages,
 		ProcessMode:      options.ProcessMode,
 		UploadPDF:        options.UploadPDF,
+		UploadMode:       options.UploadMode,
 		ReplaceOriginal:  options.ReplaceOriginal,
 		CopyMetadata:     options.CopyMetadata,
 		PromptOverridden: options.PromptOverride != "",
@@ -488,6 +510,7 @@ func (app *App) getOCRConfigHandler(c *gin.Context) {
 			"limit_pages":      defaults.LimitPages,
 			"process_mode":     defaults.ProcessMode,
 			"upload_pdf":       defaults.UploadPDF,
+			"upload_mode":      defaults.UploadMode,
 			"replace_original": defaults.ReplaceOriginal,
 			"copy_metadata":    defaults.CopyMetadata,
 		},
@@ -535,6 +558,10 @@ func (app *App) updateOCRDefaultsHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "replace_original requires upload_pdf"})
 		return
 	}
+	if defaults.ReplaceOriginal != nil && *defaults.ReplaceOriginal && app.pdfUploadMode == PDFUploadModeVersion {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "replace_original is not available when PDF_UPLOAD_MODE=version"})
+		return
+	}
 	// Mirror the submit-time guard: a saved upload_pdf default without an
 	// hOCR-capable provider would break every run that inherits it.
 	if uploadEnabled && !app.ocrSupportsHOCR() {
@@ -569,6 +596,7 @@ func (app *App) respondWithOCRDefaults(c *gin.Context) {
 			"limit_pages":      effective.LimitPages,
 			"process_mode":     effective.ProcessMode,
 			"upload_pdf":       effective.UploadPDF,
+			"upload_mode":      effective.UploadMode,
 			"replace_original": effective.ReplaceOriginal,
 			"copy_metadata":    effective.CopyMetadata,
 		},

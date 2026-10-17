@@ -14,7 +14,9 @@ import {
 import axios from "axios";
 import classNames from "classnames";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import Button from "./components/ui/Button";
+import PersistenceWarning from "./components/PersistenceWarning";
 import Toast, { ToastData } from "./components/ui/Toast";
 
 // ---------------------------------------------------------------------------
@@ -26,6 +28,7 @@ interface WorkflowConfig {
   name: string;
   trigger_tag: string;
   completion_tag?: string;
+  require_approval?: boolean;
   generate_titles?: boolean | null;
   generate_tags?: boolean | null;
   generate_correspondents?: boolean | null;
@@ -34,6 +37,7 @@ interface WorkflowConfig {
   generate_custom_fields?: boolean | null;
   enable_ocr?: boolean | null;
   ocr_limit_pages?: number | null;
+  custom_field_ids?: number[];
   prompts?: Record<string, string>;
 }
 
@@ -49,11 +53,14 @@ type FlagKey =
 interface WorkflowDefaults {
   auto_tag: string;
   auto_tag_complete: string;
+  manual_tag?: string;
   storage_dir: string;
   ocr_enabled: boolean;
   ocr_prompt_override_supported: boolean;
   generate: Record<FlagKey, boolean>;
   prompts: Record<string, string>;
+  custom_fields: { id: number; name: string; data_type: string }[];
+  custom_field_ids: number[];
 }
 
 interface WaitingDocument {
@@ -81,14 +88,15 @@ interface PreviewResult {
   ocr_skipped: boolean;
 }
 
-const PROMPT_KEYS: { key: string; label: string; file: string }[] = [
-  { key: "title_prompt", label: "Title", file: "title_prompt.tmpl" },
-  { key: "tag_prompt", label: "Tags", file: "tag_prompt.tmpl" },
-  { key: "correspondent_prompt", label: "Correspondent", file: "correspondent_prompt.tmpl" },
-  { key: "document_type_prompt", label: "Document type", file: "document_type_prompt.tmpl" },
-  { key: "date_prompt", label: "Created date", file: "created_date_prompt.tmpl" },
-  { key: "custom_field_prompt", label: "Custom fields", file: "custom_field_prompt.tmpl" },
-  { key: "ocr_prompt", label: "OCR", file: "ocr_prompt.tmpl" },
+/** Each prompt belongs to a step; a prompt is only relevant while its step runs. */
+const PROMPT_KEYS: { key: string; label: string; file: string; step: FlagKey | "enable_ocr" }[] = [
+  { key: "title_prompt", label: "Title", file: "title_prompt.tmpl", step: "generate_titles" },
+  { key: "tag_prompt", label: "Tags", file: "tag_prompt.tmpl", step: "generate_tags" },
+  { key: "correspondent_prompt", label: "Correspondent", file: "correspondent_prompt.tmpl", step: "generate_correspondents" },
+  { key: "document_type_prompt", label: "Document type", file: "document_type_prompt.tmpl", step: "generate_document_types" },
+  { key: "date_prompt", label: "Created date", file: "created_date_prompt.tmpl", step: "generate_created_date" },
+  { key: "custom_field_prompt", label: "Custom fields", file: "custom_field_prompt.tmpl", step: "generate_custom_fields" },
+  { key: "ocr_prompt", label: "OCR", file: "ocr_prompt.tmpl", step: "enable_ocr" },
 ];
 
 const FLAG_KEYS: { key: FlagKey; label: string }[] = [
@@ -182,6 +190,71 @@ const FieldError: React.FC<{ message?: string }> = ({ message }) =>
   ) : null;
 
 /** Inherit / On / Off, showing what "inherit" currently means. */
+/** Which custom fields a workflow fills: the global selection, or its own. */
+const CustomFieldPicker: React.FC<{
+  defaults: WorkflowDefaults | null;
+  value: number[] | undefined;
+  onChange: (ids: number[]) => void;
+  own: boolean;
+  onOwnChange: (own: boolean) => void;
+}> = ({ defaults, value, onChange, own, onOwnChange: setOwn }) => {
+  const fields = defaults?.custom_fields ?? [];
+  const nameOf = (id: number) => fields.find((f) => f.id === id)?.name ?? `#${id}`;
+  const globalNames = (defaults?.custom_field_ids ?? []).map(nameOf);
+  const selected = value ?? [];
+  const toggle = (id: number) =>
+    onChange(selected.includes(id) ? selected.filter((x) => x !== id) : [...selected, id]);
+
+  return (
+    <div className="space-y-2 rounded-md border border-line px-3 py-2" role="radiogroup" aria-label="Custom fields to fill">
+      <p className="text-sm">Custom fields to fill</p>
+      <label className="flex items-start gap-2 text-sm">
+        <input
+          type="radio"
+          className="mt-1 accent-[var(--color-primary)]"
+          checked={!own}
+          onChange={() => {
+            setOwn(false);
+            onChange([]);
+          }}
+        />
+        <span>
+          Same as Settings
+          <span className="block text-xs text-muted">
+            {globalNames.length > 0 ? globalNames.join(", ") : "No fields selected in Settings"}
+          </span>
+        </span>
+      </label>
+      <label className="flex items-start gap-2 text-sm">
+        <input type="radio" className="mt-1 accent-[var(--color-primary)]" checked={own} onChange={() => setOwn(true)} />
+        <span>Only these fields for this workflow</span>
+      </label>
+      {own &&
+        (fields.length === 0 ? (
+          <p className="pl-6 text-xs text-muted">There are no custom fields in paperless-ngx yet.</p>
+        ) : (
+          <div className="grid grid-cols-1 gap-1 pl-6 sm:grid-cols-2">
+            {fields.map((f) => (
+              <label key={f.id} className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="accent-[var(--color-primary)]"
+                  checked={selected.includes(f.id)}
+                  onChange={() => toggle(f.id)}
+                />
+                <span>{f.name}</span>
+                <span className="text-xs text-faint">{f.data_type}</span>
+              </label>
+            ))}
+            {selected.length === 0 && (
+              <p className="text-xs text-warn sm:col-span-2">Choose at least one field, or use the Settings selection.</p>
+            )}
+          </div>
+        ))}
+    </div>
+  );
+};
+
 const StepToggle: React.FC<{
   label: string;
   value: boolean | null | undefined;
@@ -241,7 +314,7 @@ const ResultRow: React.FC<{ label: string; before?: string; after: string }> = (
   </div>
 );
 
-const TryIt: React.FC<{ workflow: WorkflowConfig; savedId?: string }> = ({ workflow, savedId }) => {
+const TryIt: React.FC<{ workflow: WorkflowConfig; savedId?: string; blocked?: string }> = ({ workflow, savedId, blocked }) => {
   const [waiting, setWaiting] = useState<WaitingDocument[] | null>(null);
   const [documentId, setDocumentId] = useState("");
   const [running, setRunning] = useState(false);
@@ -315,7 +388,8 @@ const TryIt: React.FC<{ workflow: WorkflowConfig; savedId?: string }> = ({ workf
           variant="primary"
           onClick={run}
           loading={running}
-          disabled={!documentId || Number(documentId) <= 0}
+          disabled={!documentId || Number(documentId) <= 0 || !!blocked}
+          title={blocked}
         >
           <BeakerIcon className="h-4 w-4" aria-hidden="true" /> Run test
         </Button>
@@ -416,6 +490,24 @@ const WorkflowEditor: React.FC<WorkflowEditorProps> = ({
   const setPrompt = (key: string, value: string) =>
     setWf((prev) => ({ ...prev, prompts: { ...(prev.prompts ?? {}), [key]: value } }));
 
+  // Which prompts this workflow has its own version of. Tracked explicitly so
+  // the editor does not jump back to "global" while someone clears the text.
+  const [ownPrompts, setOwnPrompts] = useState<Set<string>>(
+    () => new Set(customPromptKeys(initial))
+  );
+  const addOwnPrompt = (key: string) => {
+    setOwnPrompts((prev) => new Set(prev).add(key));
+    if (!wf.prompts?.[key]?.trim()) setPrompt(key, defaults?.prompts[key] ?? "");
+  };
+  const removeOwnPrompt = (key: string) => {
+    setOwnPrompts((prev) => {
+      const next = new Set(prev);
+      next.delete(key);
+      return next;
+    });
+    setPrompt(key, "");
+  };
+
   // Instant feedback for the mistakes the server would reject anyway.
   const triggerError = (() => {
     if (!wf.trigger_tag.trim()) return undefined;
@@ -439,7 +531,9 @@ const WorkflowEditor: React.FC<WorkflowEditorProps> = ({
     if (chained) return `This is the trigger of "${chained.name || chained.id}"; workflows can't be chained.`;
     return undefined;
   })();
-  const canSave = !!wf.trigger_tag.trim() && !triggerError && !completionError;
+  // "Only these fields" with nothing checked would silently fall back to the
+  // Settings selection, so it blocks saving and test runs instead.
+  const [ownFields, setOwnFields] = useState((initial.custom_field_ids?.length ?? 0) > 0);
 
   const tagExists = (name?: string) => !!name?.trim() && tagNames.some((t) => sameTag(t, name));
   const newTagHint = (name?: string) =>
@@ -447,10 +541,17 @@ const WorkflowEditor: React.FC<WorkflowEditorProps> = ({
       ? "New tag — it will be created in paperless-ngx when you save."
       : undefined;
 
-  const visiblePrompts = PROMPT_KEYS.filter((p) => p.key !== "ocr_prompt" || wf.enable_ocr);
+  // Only steps that actually run need a prompt; the others are hidden to keep
+  // the editor small. An own prompt of a hidden step is kept, not deleted.
+  const stepRuns = (step: FlagKey | "enable_ocr") =>
+    step === "enable_ocr" ? !!wf.enable_ocr : (wf[step] ?? defaults?.generate[step] ?? true);
+  const fieldsIncomplete = ownFields && (wf.custom_field_ids?.length ?? 0) === 0 && stepRuns("generate_custom_fields");
+  const canSave = !!wf.trigger_tag.trim() && !triggerError && !completionError && !fieldsIncomplete;
+  const visiblePrompts = PROMPT_KEYS.filter((p) => stepRuns(p.step));
+  const hiddenOwnPrompts = PROMPT_KEYS.filter((p) => !stepRuns(p.step) && ownPrompts.has(p.key));
   const active = visiblePrompts.find((p) => p.key === activePrompt) ?? visiblePrompts[0];
-  const activeValue = wf.prompts?.[active.key] ?? "";
-  const globalPrompt = defaults?.prompts[active.key] ?? "";
+  const activeValue = active ? wf.prompts?.[active.key] ?? "" : "";
+  const globalPrompt = active ? defaults?.prompts[active.key] ?? "" : "";
   const variables = templateVariables(activeValue.trim() ? activeValue : globalPrompt);
 
   return (
@@ -529,6 +630,24 @@ const WorkflowEditor: React.FC<WorkflowEditorProps> = ({
             </div>
           )}
         </div>
+        <div className="mt-4 flex items-start gap-2.5 text-sm">
+          <input
+            id="wf-approval"
+            type="checkbox"
+            className="mt-0.5 h-4 w-4 rounded border-line accent-primary"
+            checked={!!wf.require_approval}
+            onChange={(e) => set("require_approval", e.target.checked)}
+            aria-describedby="wf-approval-hint"
+          />
+          <div>
+            <label htmlFor="wf-approval">Wait for my approval before writing to paperless-ngx</label>
+            <p id="wf-approval-hint" className="mt-0.5 text-xs text-muted">
+              Suggestions wait on the Home page until you apply them; the document gets{" "}
+              {defaults?.manual_tag ? <span className="font-mono">{defaults.manual_tag}</span> : "the review tag"}{" "}
+              meanwhile. The completion tag is added when you apply.
+            </p>
+          </div>
+        </div>
       </Section>
 
       <Section
@@ -546,6 +665,15 @@ const WorkflowEditor: React.FC<WorkflowEditorProps> = ({
             />
           ))}
         </div>
+        {stepRuns("generate_custom_fields") && (
+          <CustomFieldPicker
+            defaults={defaults}
+            value={wf.custom_field_ids}
+            onChange={(ids) => set("custom_field_ids", ids)}
+            own={ownFields}
+            onOwnChange={setOwnFields}
+          />
+        )}
         <div className="rounded-md border border-line px-3 py-2">
           <label className="flex items-center justify-between gap-3">
             <span className="text-sm">
@@ -584,80 +712,124 @@ const WorkflowEditor: React.FC<WorkflowEditorProps> = ({
 
       <Section
         title="Prompts"
-        hint="Only change what differs. A prompt you leave empty uses the global one from Settings."
+        hint="Only the steps this workflow runs show a prompt. Each one either uses the shared global prompt or has its own version for this workflow only."
       >
-        <div className="flex flex-wrap gap-1.5" role="tablist">
-          {visiblePrompts.map(({ key, label }) => {
-            const custom = !!wf.prompts?.[key]?.trim();
-            return (
-              <button
-                key={key}
-                type="button"
-                role="tab"
-                aria-selected={active.key === key}
-                onClick={() => setActivePrompt(key)}
-                className={classNames(
-                  "rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
-                  active.key === key ? "bg-primary-tint text-ink" : "bg-surface-2 text-muted hover:text-ink"
-                )}
-              >
-                {label}
-                {custom && (
-                  <span className="ml-1.5 inline-block h-1.5 w-1.5 rounded-full bg-primary align-middle" />
-                )}
-              </button>
-            );
-          })}
-        </div>
-
-        <div className="flex flex-wrap items-center justify-between gap-2">
+        {hiddenOwnPrompts.length > 0 && (
           <p className="text-xs text-muted">
-            {activeValue.trim() ? (
-              <>
-                Custom prompt, saved as <span className="font-mono">{active.file}</span>
-              </>
-            ) : (
-              "Using the global prompt (shown greyed out below)."
-            )}
+            Own prompt kept but not shown because its step is off:{" "}
+            {hiddenOwnPrompts.map((p) => p.label).join(", ")}. Turn the step on to see it again.
           </p>
-          {activeValue.trim() ? (
-            <Button size="sm" variant="ghost" onClick={() => setPrompt(active.key, "")}>
-              <ArrowPathIcon className="h-4 w-4" aria-hidden="true" /> Use global prompt
-            </Button>
-          ) : (
-            globalPrompt && (
-              <Button size="sm" variant="secondary" onClick={() => setPrompt(active.key, globalPrompt)}>
-                <PencilSquareIcon className="h-4 w-4" aria-hidden="true" /> Customize
-              </Button>
-            )
-          )}
-        </div>
-        {active.key === "ocr_prompt" && defaults && !defaults.ocr_prompt_override_supported && (
-          <p className="text-xs text-warn">Only the LLM OCR provider can use a custom OCR prompt.</p>
         )}
-        <textarea
-          aria-label={`${active.label} prompt`}
-          className="w-full rounded-md border border-line bg-surface px-3 py-2 font-mono text-xs leading-relaxed placeholder:text-faint focus:border-primary focus:outline-none"
-          rows={12}
-          placeholder={globalPrompt || "Leave empty to use the global prompt."}
-          value={activeValue}
-          onChange={(e) => setPrompt(active.key, e.target.value)}
-        />
-        {variables.length > 0 && (
-          <p className="flex flex-wrap items-center gap-1 text-xs text-muted">
-            Variables:
-            {variables.map((v) => (
-              <code key={v} className="rounded bg-surface-2 px-1.5 py-0.5 font-mono">
-                {`{{${v}}}`}
-              </code>
-            ))}
+        {active ? (
+          <>
+            <div className="flex flex-wrap gap-1.5" role="tablist">
+              {visiblePrompts.map(({ key, label }) => (
+                <button
+                  key={key}
+                  type="button"
+                  role="tab"
+                  aria-selected={active.key === key}
+                  onClick={() => setActivePrompt(key)}
+                  className={classNames(
+                    "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
+                    active.key === key ? "bg-primary-tint text-ink" : "bg-surface-2 text-muted hover:text-ink"
+                  )}
+                >
+                  {label}
+                  <span
+                    className={classNames(
+                      "rounded px-1 text-[0.6875rem] font-normal",
+                      ownPrompts.has(key) ? "bg-primary text-primary-ink" : "text-faint"
+                    )}
+                  >
+                    {ownPrompts.has(key) ? "own" : "global"}
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            {active.key === "ocr_prompt" && defaults && !defaults.ocr_prompt_override_supported && (
+              <p className="text-xs text-warn">Only the LLM OCR provider can use a custom OCR prompt.</p>
+            )}
+
+            {ownPrompts.has(active.key) ? (
+              <div className="space-y-2 rounded-md border border-primary p-3">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-medium">Own {active.label.toLowerCase()} prompt for this workflow</p>
+                    <p className="text-xs text-muted">
+                      Applies only to documents processed by this workflow. Saved as{" "}
+                      <span className="font-mono">{active.file}</span> in{" "}
+                      {wf.id ? (
+                        <span className="font-mono">
+                          {defaults?.storage_dir ?? "prompts/workflows"}/{wf.id}/
+                        </span>
+                      ) : (
+                        "the workflow's own folder"
+                      )}
+                      . The global prompt stays unchanged.
+                    </p>
+                  </div>
+                  <Button size="sm" variant="ghost" onClick={() => removeOwnPrompt(active.key)}>
+                    <ArrowPathIcon className="h-4 w-4" aria-hidden="true" /> Use global prompt instead
+                  </Button>
+                </div>
+                <textarea
+                  aria-label={`${active.label} prompt`}
+                  className="w-full rounded-md border border-line bg-surface px-3 py-2 font-mono text-xs leading-relaxed focus:border-primary focus:outline-none"
+                  rows={12}
+                  value={activeValue}
+                  onChange={(e) => setPrompt(active.key, e.target.value)}
+                />
+              </div>
+            ) : (
+              <div className="space-y-2 rounded-md border border-dashed border-line bg-surface-2 p-3">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-medium">Uses the global {active.label.toLowerCase()} prompt</p>
+                    <p className="text-xs text-muted">
+                      Shared with the default AUTO_TAG processing and every workflow without its own
+                      version. Change it under{" "}
+                      <Link to="/settings" className="text-primary hover:underline">
+                        Settings
+                      </Link>{" "}
+                      — that affects all of them.
+                    </p>
+                  </div>
+                  <Button size="sm" variant="secondary" onClick={() => addOwnPrompt(active.key)}>
+                    <PencilSquareIcon className="h-4 w-4" aria-hidden="true" /> Write own prompt for this workflow
+                  </Button>
+                </div>
+                <pre
+                  aria-label={`Global ${active.label} prompt (read-only)`}
+                  className="max-h-48 overflow-auto whitespace-pre-wrap rounded border border-line bg-surface px-3 py-2 font-mono text-xs leading-relaxed text-muted"
+                >
+                  {globalPrompt || "(no global prompt found)"}
+                </pre>
+              </div>
+            )}
+
+            {variables.length > 0 && (
+              <p className="flex flex-wrap items-center gap-1 text-xs text-muted">
+                Variables:
+                {variables.map((v) => (
+                  <code key={v} className="rounded bg-surface-2 px-1.5 py-0.5 font-mono">
+                    {`{{${v}}}`}
+                  </code>
+                ))}
+              </p>
+            )}
+          </>
+        ) : (
+          <p className="rounded-md border border-dashed border-line px-3 py-4 text-sm text-muted">
+            All steps are off, so this workflow needs no prompts.
           </p>
         )}
       </Section>
 
       <Section title="Try it" hint="See what this workflow does to a real document before you save it.">
         {showTryIt ? (
-          <TryIt workflow={wf} savedId={isNew ? undefined : initial.id} />
+          <TryIt workflow={wf} savedId={isNew ? undefined : initial.id} blocked={fieldsIncomplete ? "Choose at least one custom field first." : undefined} />
         ) : (
           <Button variant="secondary" onClick={() => setShowTryIt(true)}>
             <BeakerIcon className="h-4 w-4" aria-hidden="true" /> Test on a document
@@ -716,6 +888,11 @@ const WorkflowCard: React.FC<{
   });
   const prompts = customPromptKeys(wf);
   const completion = wf.completion_tag || defaults?.auto_tag_complete;
+  // The fields the custom fields step will actually fill: the workflow's own
+  // selection, or the one from Settings it inherits.
+  const fillsCustomFields = steps.some(({ key }) => key === "generate_custom_fields");
+  const ownFieldIDs = (wf.custom_field_ids?.length ?? 0) > 0;
+  const fieldIDs = ownFieldIDs ? wf.custom_field_ids! : (defaults?.custom_field_ids ?? []);
 
   return (
     <div className="rounded-lg border border-line bg-surface p-5 shadow-card">
@@ -724,6 +901,11 @@ const WorkflowCard: React.FC<{
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="truncate font-semibold">{wf.name || wf.id}</h3>
             <WaitingBadge id={wf.id} />
+            {wf.require_approval && (
+              <span className="rounded-full bg-warn-tint px-2 py-0.5 text-xs font-medium text-ink">
+                Needs approval
+              </span>
+            )}
           </div>
           <p className="flex flex-wrap items-center gap-1.5 text-xs text-muted">
             <TagChip>{wf.trigger_tag}</TagChip>
@@ -742,6 +924,12 @@ const WorkflowCard: React.FC<{
               ? `Own prompts: ${prompts.map((k) => PROMPT_KEYS.find((p) => p.key === k)?.label ?? k).join(", ")}`
               : "Uses the global prompts"}
           </p>
+          {fillsCustomFields && fieldIDs.length > 0 && (
+            <p className="text-xs text-muted">
+              Fills: {fieldIDs.map((id) => defaults?.custom_fields.find((f) => f.id === id)?.name ?? `#${id}`).join(", ")}
+              {!ownFieldIDs && " (from Settings)"}
+            </p>
+          )}
         </div>
         <div className="flex shrink-0 gap-1">
           <Button size="sm" variant="ghost" onClick={onEdit} aria-label={`Edit ${wf.name || wf.id}`} title="Edit">
@@ -841,12 +1029,11 @@ const Workflows: React.FC = () => {
   const dismissToast = useCallback(() => setToast(null), []);
 
   const handleSave = async (edited: WorkflowConfig) => {
-    // A prompt copied from the global one and left unchanged is no override;
-    // saving it would hide later changes to the global prompt.
+    // An own prompt is an explicit choice in the editor, so it is kept even
+    // when its text still matches the global one: it pins the prompt for this
+    // workflow. Only blank prompts are dropped.
     const prompts = Object.fromEntries(
-      Object.entries(edited.prompts ?? {}).filter(
-        ([key, value]) => value.trim() && value.trim() !== (defaults?.prompts[key] ?? "").trim()
-      )
+      Object.entries(edited.prompts ?? {}).filter(([, value]) => value.trim())
     );
     const wf = { ...edited, prompts };
     setSaving(true);
@@ -928,6 +1115,8 @@ const Workflows: React.FC = () => {
           </Button>
         )}
       </div>
+
+      <PersistenceWarning dirs={["prompts", "/root/prompts"]} />
 
       {error && (
         <div

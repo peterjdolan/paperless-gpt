@@ -2,12 +2,25 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/tmc/langchaingo/llms"
+	"github.com/tmc/langchaingo/llms/anthropic"
+	"github.com/tmc/langchaingo/llms/openai"
 	"golang.org/x/time/rate"
+)
+
+// llmPurpose is the metrics label for which LLM role a RateLimitedLLM serves.
+type llmPurpose string
+
+const (
+	llmPurposeMetadata llmPurpose = "metadata"
+	llmPurposeVision   llmPurpose = "vision"
 )
 
 // RateLimitedLLM wraps an LLM client with rate limiting and retry capabilities
@@ -18,12 +31,54 @@ type RateLimitedLLM struct {
 	backoffMin   time.Duration
 	backoffMax   time.Duration
 	backoffScale float64
+	purpose      llmPurpose
+}
+
+const maxProviderRetryDelay = 15 * time.Minute
+
+// retryAfterError is implemented by provider clients that preserve an
+// upstream Retry-After response header. The wrapper uses that server-provided
+// floor instead of issuing another request during the provider cooldown.
+type retryAfterError interface {
+	RetryAfter() time.Duration
+}
+
+func retryDelay(err error, backoff time.Duration) time.Duration {
+	var retryErr retryAfterError
+	if errors.As(err, &retryErr) {
+		if delay := retryErr.RetryAfter(); delay > backoff {
+			return delay
+		}
+	}
+	// langchaingo sanitizes transport errors and discards their headers. The
+	// OpenAI-compatible transport preserves only the parsed cooldown in this
+	// private marker, without exposing the upstream response or credentials.
+	const marker = "retry-after-ms:"
+	errText := err.Error()
+	if index := strings.Index(strings.ToLower(errText), marker); index >= 0 {
+		value := errText[index+len(marker):]
+		end := 0
+		for end < len(value) && value[end] >= '0' && value[end] <= '9' {
+			end++
+		}
+		maxMilliseconds := int64((1<<63 - 1) / int64(time.Millisecond))
+		if milliseconds, parseErr := strconv.ParseInt(value[:end], 10, 64); parseErr == nil && milliseconds >= 0 && milliseconds <= maxMilliseconds {
+			if delay := time.Duration(milliseconds) * time.Millisecond; delay > backoff {
+				return delay
+			}
+		}
+	}
+	return backoff
 }
 
 // Call implements the llms.Model interface
 func (r *RateLimitedLLM) Call(ctx context.Context, prompt string, options ...llms.CallOption) (string, error) {
+	start := time.Now()
+	purpose := r.metricsPurpose()
+
 	if r.rateLimiter != nil {
 		if err := r.rateLimiter.Wait(ctx); err != nil {
+			observeLLMRequest(purpose, resultFromContext(ctx, err), start)
 			return "", fmt.Errorf("rate limiter wait failed: %w", err)
 		}
 	}
@@ -34,15 +89,18 @@ func (r *RateLimitedLLM) Call(ctx context.Context, prompt string, options ...llm
 	for {
 		response, err := r.llm.Call(ctx, prompt, options...)
 		if err == nil {
+			observeLLMRequest(purpose, resultSuccess, start)
 			return response, nil
 		}
 
 		// Check if we should retry
 		if attempt >= r.maxRetries {
+			finalErr := err
 			if lastErr != nil {
-				return "", fmt.Errorf("all retry attempts failed, last error: %w", lastErr)
+				finalErr = fmt.Errorf("all retry attempts failed, last error: %w", lastErr)
 			}
-			return "", err
+			observeLLMRequest(purpose, resultFromContext(ctx, finalErr), start)
+			return "", finalErr
 		}
 
 		// Calculate exponential backoff with jitter
@@ -52,16 +110,31 @@ func (r *RateLimitedLLM) Call(ctx context.Context, prompt string, options ...llm
 		}
 		// Add jitter by randomly adjusting +/- 20%
 		jitter := time.Duration(float64(backoff) * (0.8 + 0.4*rand.Float64()))
+		// Retry-After is a server-provided lower bound; apply it after jitter so
+		// the randomized delay can never wake before the provider's cooldown.
+		jitter = retryDelay(err, jitter)
+		if jitter > maxProviderRetryDelay {
+			observeLLMRequest(purpose, resultError, start)
+			return "", fmt.Errorf("provider retry delay %s exceeds limit", jitter)
+		}
 
 		select {
 		case <-ctx.Done():
+			observeLLMRequest(purpose, resultFromContext(ctx, ctx.Err()), start)
 			return "", ctx.Err()
 		case <-time.After(jitter):
 			// Continue with retry
+			incLLMRetry(purpose)
 			attempt++
 			lastErr = err
 		}
 	}
+}
+
+// isEmptyLLMResponse reports whether err is langchaingo's "no response" error,
+// returned when the provider answered successfully but without any content.
+func isEmptyLLMResponse(err error) bool {
+	return errors.Is(err, anthropic.ErrEmptyResponse) || errors.Is(err, openai.ErrEmptyResponse)
 }
 
 // RateLimitConfig holds configuration for rate limiting and retries
@@ -77,6 +150,10 @@ type RateLimitConfig struct {
 	// BackoffMaxWait is the maximum wait time between retries
 	// Defaults to 30 seconds if not specified
 	BackoffMaxWait time.Duration
+
+	// Purpose is which LLM role this wrapper serves for metrics labeling.
+	// Defaults to llmPurposeMetadata when empty.
+	Purpose llmPurpose
 }
 
 // NewRateLimitedLLM creates a new rate-limited LLM client
@@ -101,6 +178,11 @@ func NewRateLimitedLLM(llm llms.Model, config RateLimitConfig) *RateLimitedLLM {
 		backoffMax = 30 * time.Second // Default to 30 seconds
 	}
 
+	purpose := config.Purpose
+	if purpose == "" {
+		purpose = llmPurposeMetadata
+	}
+
 	return &RateLimitedLLM{
 		llm:          llm,
 		rateLimiter:  limiter,
@@ -108,14 +190,26 @@ func NewRateLimitedLLM(llm llms.Model, config RateLimitConfig) *RateLimitedLLM {
 		backoffMin:   backoffMin,
 		backoffMax:   backoffMax,
 		backoffScale: 2.0, // Exponential backoff multiplier
+		purpose:      purpose,
 	}
+}
+
+func (r *RateLimitedLLM) metricsPurpose() llmPurpose {
+	if r.purpose == "" {
+		return llmPurposeMetadata
+	}
+	return r.purpose
 }
 
 // GenerateContent implements the LLM interface with rate limiting and retries
 func (r *RateLimitedLLM) GenerateContent(ctx context.Context, messages []llms.MessageContent, options ...llms.CallOption) (*llms.ContentResponse, error) {
+	start := time.Now()
+	purpose := r.metricsPurpose()
+
 	if r.rateLimiter != nil {
 		// Wait for rate limiter
 		if err := r.rateLimiter.Wait(ctx); err != nil {
+			observeLLMRequest(purpose, resultFromContext(ctx, err), start)
 			return nil, fmt.Errorf("rate limiter wait failed: %w", err)
 		}
 	}
@@ -126,16 +220,34 @@ func (r *RateLimitedLLM) GenerateContent(ctx context.Context, messages []llms.Me
 	for {
 		resp, err := r.llm.GenerateContent(ctx, messages, options...)
 		if err == nil {
+			observeLLMRequest(purpose, resultSuccess, start)
+			if resp != nil && len(resp.Choices) > 0 && resp.Choices[0] != nil {
+				observeLLMTokens(purpose, resp.Choices[0].GenerationInfo)
+			}
 			// Return the pointer response directly
 			return resp, nil
+		}
+		if isEmptyLLMResponse(err) {
+			// The model answered with no content at all, which Claude does
+			// for e.g. a document whose text is just "67". That is an answer,
+			// not a transport failure: retrying re-bills the same prompt for
+			// the same result, and failing would fail the whole document.
+			// Hand callers an empty reply instead, the same thing they get
+			// when an OpenAI-compatible model returns empty content, so the
+			// field is skipped like any other empty suggestion.
+			log.Warn("LLM returned an empty response; treating it as an empty suggestion")
+			observeLLMRequest(purpose, resultSuccess, start)
+			return &llms.ContentResponse{Choices: []*llms.ContentChoice{{}}}, nil
 		}
 
 		// Check if we should retry
 		if attempt >= r.maxRetries {
+			finalErr := err
 			if lastErr != nil {
-				return nil, fmt.Errorf("all retry attempts failed, last error: %w", lastErr)
+				finalErr = fmt.Errorf("all retry attempts failed, last error: %w", lastErr)
 			}
-			return nil, err
+			observeLLMRequest(purpose, resultFromContext(ctx, finalErr), start)
+			return nil, finalErr
 		}
 
 		// Calculate exponential backoff with jitter
@@ -145,12 +257,19 @@ func (r *RateLimitedLLM) GenerateContent(ctx context.Context, messages []llms.Me
 		}
 		// Add jitter by randomly adjusting +/- 20%
 		jitter := time.Duration(float64(backoff) * (0.8 + 0.4*rand.Float64()))
+		jitter = retryDelay(err, jitter)
+		if jitter > maxProviderRetryDelay {
+			observeLLMRequest(purpose, resultError, start)
+			return nil, fmt.Errorf("provider retry delay %s exceeds limit", jitter)
+		}
 
 		select {
 		case <-ctx.Done():
+			observeLLMRequest(purpose, resultFromContext(ctx, ctx.Err()), start)
 			return nil, ctx.Err()
 		case <-time.After(jitter):
 			// Continue with retry
+			incLLMRetry(purpose)
 			attempt++
 			lastErr = err
 		}

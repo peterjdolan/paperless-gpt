@@ -137,6 +137,12 @@ type WorkflowConfig struct {
 	GenerateCreatedDate    *bool `json:"generate_created_date,omitempty"`
 	GenerateDocumentTypes  *bool `json:"generate_document_types,omitempty"`
 	GenerateCustomFields   *bool `json:"generate_custom_fields,omitempty"`
+	// CustomFieldIDs are the custom fields this workflow fills. Empty means the
+	// global selection from Settings.
+	CustomFieldIDs []int `json:"custom_field_ids,omitempty"`
+	// RequireApproval holds the workflow's suggestions until the user
+	// approves them in the review queue instead of writing them right away.
+	RequireApproval bool `json:"require_approval,omitempty"`
 	// EnableOCR, when true, runs OCR on the document before metadata generation.
 	// nil or false means OCR is skipped for this workflow.
 	EnableOCR *bool `json:"enable_ocr,omitempty"`
@@ -212,8 +218,19 @@ type Correspondent struct {
 }
 
 // OCROptions contains options for the OCR processing
+// Searchable-PDF upload modes (PDF_UPLOAD_MODE).
+const (
+	// PDFUploadModeNew uploads the searchable PDF as a new document.
+	PDFUploadModeNew = "new"
+	// PDFUploadModeVersion adds the searchable PDF as a new version of the same
+	// document (paperless-ngx 3.0+). The document id, its metadata and the
+	// original file are kept; nothing is deleted.
+	PDFUploadModeVersion = "version"
+)
+
 type OCROptions struct {
 	UploadPDF       bool   // Whether to upload the generated PDF
+	UploadMode      string // PDFUploadModeNew (default) or PDFUploadModeVersion
 	ReplaceOriginal bool   // Whether to delete the original document after uploading
 	CopyMetadata    bool   // Whether to copy metadata from the original document
 	LimitPages      int    // Limit on the number of pages to process (0 = no limit)
@@ -245,7 +262,7 @@ type ClientInterface interface {
 	GetDocument(ctx context.Context, documentID int) (Document, error)
 	GetDocumentThumbnail(ctx context.Context, documentID int) ([]byte, string, error)
 	SearchDocuments(ctx context.Context, query string, pageSize int) ([]Document, error)
-	FindDocumentIDsByReference(ctx context.Context, reference string, limit int) ([]int, error)
+	FindDocumentIDsByReference(ctx context.Context, reference string, excludeID, maxMatches int) (ids []int, tooMany bool, err error)
 	GetDocumentPageImage(ctx context.Context, documentID int, pageIndex int) ([]byte, error)
 	GetAllTags(ctx context.Context) (map[string]int, error)
 	GetAllCorrespondents(ctx context.Context) (map[string]int, error)
@@ -255,6 +272,7 @@ type ClientInterface interface {
 	DownloadDocumentAsImages(ctx context.Context, documentID int, pageLimit int) ([]string, int, error)
 	DownloadDocumentAsPDF(ctx context.Context, documentID int, limitPages int, split bool) ([]string, []byte, int, error)
 	UploadDocument(ctx context.Context, data []byte, filename string, metadata map[string]interface{}) (string, error)
+	UploadDocumentVersion(ctx context.Context, documentID int, data []byte, filename string, versionLabel string) (string, error)
 	GetTaskStatus(ctx context.Context, taskID string) (map[string]interface{}, error)
 	DeleteDocument(ctx context.Context, documentID int) error
 }

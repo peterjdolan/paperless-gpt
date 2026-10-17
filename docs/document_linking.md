@@ -41,7 +41,7 @@ A few setups where this changes how the archive is used:
 2. **In paperless-gpt**, open **Settings**, enable custom field generation and select that field. Choose the **Append** or **Update** write mode (see the note on **Replace** below).
 3. Process documents as usual, through manual review or with the `paperless-gpt-auto` tag. You can combine the link field with any other custom fields you already extract.
 
-There is no extra environment variable to set.
+There is no extra environment variable to set. The settings from step 2 are stored in `/app/config/settings.json`, so mount `./config:/app/config` as a volume; otherwise they are reset whenever the container is recreated, for example on every update.
 
 ## How it decides what to link
 
@@ -53,7 +53,8 @@ The model is never asked to guess paperless-ngx document IDs. The work is split 
 The lookup is deliberately conservative, because a wrong link is worse than a missing one:
 
 - References shorter than 4 characters are ignored.
-- A reference that appears in **more than 3** other documents is treated as too generic and skipped. This catches identifiers such as your own customer number, which shows up on every letter from the same company.
+- A reference has to look like an identifier: it needs a digit, and a number made of digits alone needs at least 5 of them. Names of laws or products, a year, or a 4-digit form number printed on every letter from a bank are not looked up.
+- A reference that appears in **more than 3** other documents is treated as too generic and skipped. This catches identifiers such as your own customer number, which shows up on every letter from the same company. The whole archive counts, not just the first search results. A reference that appears in more than 200 documents, even only as part of a longer number, is skipped without looking further.
 - A document is never linked to itself.
 - If a reference matches nothing, it is dropped. If no reference resolves, the field is left out of the update entirely rather than being written with a guess.
 
